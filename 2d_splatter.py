@@ -1,12 +1,12 @@
 
 """
-Create a 2d Gaussian splatting recosntruction of an image.
+Create a 2d Gaussian splatting reconstruction of an image.
 
 Plan
 1. Load image
 2. Create a grid of points to splat onto
 3. Create a Gaussian 2D renderer - define gaussian calculation logic here
-4. Create a Gaussian 2D Model - define trainable parameters here. Define mean, covariance, covariance, rgba. 
+4. Create a Gaussian 2D Model - define trainable parameters here. Define mean, covariance, rgb, alpha, theta, scale 
         TODO - Covariance calculation from 2d rot matrix
         Create a rot matrix. Multiply it with scale matrix and the transposes as shown inthe paper.
 5. Optimizer - Adam
@@ -22,7 +22,8 @@ Rerun covariance
 
 import torch
 import torchvision
-
+import numpy as np
+from torch.optim.lr_scheduler import MultiStepLR
 import pytorch_ssim
 from torch.utils.tensorboard import SummaryWriter
 import imageio
@@ -41,10 +42,10 @@ def circular_activation(input_tensor):
     # Here is an activation function to limit theta from 0 to 2pi
     # this function activates between 0 and 2 pi
     # +1 moves the sin range from [-1 to 1] to [0 to 2]
-
+    
+    # TODO - debug this more
     # return (1 + torch.sin(input)) * torch.pi
-    # return torch.sigmoid(input) * 2 * torch.pi
-    return 2 * torch.pi * input_tensor
+    return torch.sigmoid(input_tensor) * 2 * torch.pi
 
 def load_image(filename):
     image = imageio.imread(filename)
@@ -52,6 +53,29 @@ def load_image(filename):
     image = image / 255
     return image
 
+def write_image(filename, image):
+    image = (image * 255).astype(np.uint8)
+    print(f"Out of bounds warning -> min - {image.min()}, max - {image.max()}") if image.min() < 0 or image.max() > 255 else None
+    create_path_if_not_exists(filename)
+    imageio.imwrite(filename, image)
+
+def create_path_if_not_exists(path):
+    import os
+    folder = os.path.dirname(path)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+        
+def export_video(image_folder,video_file):
+    import subprocess
+
+    frame_rate = 12
+    command = f'ffmpeg -framerate {frame_rate} -i {image_folder}/%d.jpg -c:v libx264 -pix_fmt yuv420p {video_file}'
+    subprocess.run(command, shell=True, check=True)
+
+def check_for_nans(tensor, name):
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        print(f"tensor {name} contains NaN or infinite values")
+    
 def save_model(model, filename):
     torch.save(model, filename)
 
@@ -62,33 +86,45 @@ def load_model(filename):
 def debug_gaussians(gaussian_tensor,name, max_render=25):
     # gaussian_tensor = gaussian_tensor.detach().cpu().numpy()
     gaussian_tensor = gaussian_tensor.detach()
-    indices = torch.randperm(gaussian_tensor.shape[0])
-    indices = indices[:max_render] # pick random gaussians
+    # indices = torch.randperm(gaussian_tensor.shape[0])
+    # indices = indices[:max_render] # pick random gaussians
 
     #override indices with 0-24 indices
     indices = torch.arange(0,max_render)
     grid = torchvision.utils.make_grid(gaussian_tensor[indices].permute(0,3,1,2), nrow=5)
-    print(grid.shape)
 
-    imageio.imwrite(f"logimages/gaussian_tensor-{name}-{global_step}.jpg", grid.permute(1,2,0).cpu().numpy())
+    write_image(f"logimages/gaussian_tensor-{name}-{global_step}.jpg", grid.permute(1,2,0).cpu().numpy())
 
 def debug_reconstructions(reconstructed_images, name, max_render=25):
     num_rows = int(torch.sqrt(torch.tensor(max_render)))
     grid = torchvision.utils.make_grid(reconstructed_images.permute(0,3,1,2), nrow=num_rows)
-    imageio.imwrite(f"logimages/reconstructed-{name}-{global_step}.jpg", grid.permute(1,2,0).cpu().numpy())
+    write_image(f"logimages/reconstructed-{name}-{global_step}.jpg", grid.permute(1,2,0).cpu().numpy())
 
 class GaussianRenderer2D():
+    """
+    This class renders a 2D image from a mixture of Gaussians.
+
+    The render function renders the gaussian distributions onto a 2D plane.
+    The class defines a grid of pixel coordinates to calculate the gaussian pdf.
+    The pixels are initialized to cover a range from -1.0 to 1.0 in both x and y axes.
+    It is then scaled by a factor of 3. 
+
+    Attributes:
+        render_plane_size (int): The size of the render plane (square).
+        pixels (torch.Tensor): The pixel coordinates of the render plane.
+        eps (float): A small value to avoid divide by zero errors.
+    """
     def __init__(self, render_plane_size):
         self.render_plane_size = render_plane_size
         # self.height = render_plane_size[0]
         # self.width = render_plane_size[1]
 
-        x = torch.linspace(0.0, 1.0, steps=self.render_plane_size)
-        y = torch.linspace(0.0, 1.0, steps=self.render_plane_size)
+        x = torch.linspace(-1.0, 1.0, steps=self.render_plane_size)
+        y = torch.linspace(-1.0, 1.0, steps=self.render_plane_size)
 
 	    # self.x, self.y = torch.meshgrid(x, y, indexing='ij') # check np.meshgrid indexing
         self.x, self.y = torch.meshgrid(x, y, indexing='xy')
-        self.pixels = torch.stack([self.x, self.y], dim=-1).to(device)
+        self.pixels = torch.stack([self.x, self.y], dim=-1).to(device) * 3
         self.eps = 1/255
 
     def render_plane(self):
@@ -97,54 +133,69 @@ class GaussianRenderer2D():
     def gaussian_2d_pdf(self, pixels, mean, covariance):
         # calculate the gaussian pdf function
         # implement 2d multivariate gaussian pdf function
-        # https://en.wikipedia.org/wiki/Multivariate_normal_distribution#Bivariate_case
-        # 𝐺(𝑥) = 𝑒 − 1 2 (𝑥 ) 𝑇 Σ −1 (𝑥 )
+        # 𝐺(𝑥) = 𝑒 − 1 2 (𝑥 ) 𝑇 Σ −1 (𝑥 ) (from the paper)
 
-        # prob = torch.exp(-0.5 * torch.transpose(pixel - mean) @ torch.inverse(covariance) @ (pixel - mean)) / (2 * torch.tensor(torch.pi, device=device) * torch.sqrt(torch.det(covariance)))
-        
-        #TODO - unwrap pixels
+        print(f"mean min - {mean.min()}, max - {mean.max()}") if DEBUG else None
+        print(f"pixels min - {pixels.min()}, max - {pixels.max()}") if DEBUG else None
 
         # fix the shape by pytorch broadcasting
-        #pixel_diff.shape
-        # torch.Size([10, 64, 64, 2])
-        # pixel_diff = pixels[None, ..., None] - mean[:, None, None, :] 
         pixel_diff = pixels[None,:,:,:,None] - mean[:,None,None,...]
         pixel_diff_r = pixel_diff.view(pixel_diff.shape[0], int((pixel_diff.shape[1]*pixel_diff.shape[2])) ,2,1)
 
-        # TEST - to check if the pdf is correct
+        # TEST - run this below test to check if pdf is correct
         # pdf = torch.distributions.MultivariateNormal(mean[:,:,0], covariance)
         # x = pdf.log_prob(pixels.view(int((pixel_diff.shape[1]*pixel_diff.shape[2])),1,2))
 
-        #TODO - check if this is correct
+        # TODO - check if this is correct
         prob = torch.exp(-0.5 * torch.transpose(pixel_diff_r, -1, -2) @ torch.inverse(covariance)[:,None,...] @ pixel_diff_r ) 
-        prob = prob / (2 * torch.tensor(torch.pi, device=device) * torch.sqrt(torch.det(covariance)[...,None,None,None]))
+        print(f"prob min - {prob.min()}, max - {prob.max()}") if DEBUG else None
+        # prob = prob / (2 * torch.tensor(torch.pi, device=device) * torch.sqrt(torch.det(covariance)[...,None,None,None]))
 
         return prob
     
 
     def render(self, mean, covariance, rgb, alpha, num_gaussians):
 
+        mean = torch.tanh(mean) * 3
         splat = self.gaussian_2d_pdf(self.pixels, mean, covariance)
+        print(f"covariance min - {covariance.min()}, max - {covariance.max()}") if DEBUG else None
+        print(f"mean min - {mean.min()}, max - {mean.max()}") if DEBUG else None
+        print(f"alpha min - {alpha.min()}, max - {alpha.max()}") if DEBUG else None
+        check_for_nans(splat, "splat") if DEBUG else None
+
         splat = splat.reshape(-1, self.render_plane_size, self.render_plane_size, 1)
+        print(f"splat min - {splat.min()}, max - {splat.max()}") if DEBUG else None
+
+        #normaliztion tests on splat
+        # splat = (splat - splat_min) / (splat_max - splat_min)
         splat = splat / torch.max(splat)
-        # splat = torch.sigmoid(splat)
+        print(f"splat norm min - {splat.min()}, max - {splat.max()}") if DEBUG else None
 
         debug_gaussians(splat,"gauss") if DEBUG else None
+        check_for_nans(rgb, "rgb") if DEBUG else None
 
+        rgb = torch.tanh(rgb) * 2
+        rgb = (rgb + 1 ) / 2 # normalize to 0 to 1
         splat = splat * rgb[:,None,None,...]
 
-        alpha_mask = torch.ones_like(splat) * alpha[:,None,None,...]
+        alpha_mask = torch.ones_like(splat) * torch.sigmoid(alpha[:,None,None,...]) # + self.eps
+        check_for_nans(alpha_mask, "alpha_mask") if DEBUG else None
+        
+        print(f"alpha_mask min - {alpha_mask.min()}, max - {alpha_mask.max()}") if DEBUG else None
         masked_images = splat * alpha_mask
-
         debug_gaussians(masked_images, "masked") if DEBUG else None
-        
-        blended_splat = torch.sigmoid(torch.sum(masked_images, dim=0))
-        
-        # blend based on alpha mask
+
+        # Weighted sum of all gaussians based on alpha
+        sum_masked_images = torch.sum(masked_images, dim=0) 
+
+        blended_splat = torch.sigmoid(sum_masked_images)
+
+        # TODO - try other blending approches blend based on alpha mask
+        # something similar to the below approach
         # blended_splat = splat * alpha_mask + self.pixels * (1 - alpha_mask)
 
 
-        # take care of numerical stability of alpha 
+        # TODO take care of numerical stability of alpha (excerpt from the paper)
         # page 14 -> To address this, both in
         # the forward and backward pass, we skip any blending updates with
         # 𝛼 < 𝜖 (we choose 𝜖 as 1
@@ -155,14 +206,33 @@ class GaussianRenderer2D():
         return blended_splat
     
 class GaussianImage(torch.nn.Module):
-    def __init__(self, num_gaussians, render_plane_size):
+    """
+    This class represents an image as a mixture of Gaussians, each defined by a mean, rgb, alpha, theta, scale 
+
+    There are five trainable parameters for each gaussian - mean, rgb, alpha, theta, scale
+    They are initialized randomly and trained to reconstruct the target image.
+    There is an option to initialize rgb pixels with the target image pixels based on the sampled mean.
+    The forward function is the forward pass of the gaussian image optimization process. 
+    It builds a covariance matrix from the trainable parameters and renders the gaussian image.
+
+    Attributes:
+        num_gaussians (int): The number of Gaussians to use in the mixture model.
+        mean (torch.Tensor): The means of the Gaussians.
+        alpha (torch.Tensor): The alpha values of the Gaussians.
+        scale (torch.Tensor): The scales of the Gaussians.
+        theta (torch.Tensor): The rotation angles of the Gaussians.
+        rgb (torch.Tensor): The RGB color values of the Gaussians.
+        renderer (GaussianRenderer2D): The renderer used to render the image.
+    """
+    def __init__(self, num_gaussians, render_plane_size, init_from_rgb=False):
         super().__init__()
         self.num_gaussians = num_gaussians
 
         # define trainable parameters
-        self.mean = torch.nn.Parameter(torch.rand((self.num_gaussians, 2, 1)).to(device), requires_grad=True) 
-        # self.covariance = torch.nn.Parameter(torch.rand((self.num_gaussians, 2, 2)), requires_grad=True)
-        # self.rgb = torch.nn.Parameter(torch.rand((self.num_gaussians, 3)).to(device), requires_grad=True)
+        self.mean = torch.rand((self.num_gaussians, 2, 1)).to(device)
+        self.mean = self.mean * 2 - 1
+        self.mean = torch.nn.Parameter(self.mean, requires_grad=True) 
+
         self.alpha = torch.nn.Parameter(torch.rand((self.num_gaussians, 1)).to(device), requires_grad=True)
         self.scale = torch.nn.Parameter((torch.rand(self.num_gaussians, 2)).to(device), requires_grad=True)
         # angle of rotation on the plane
@@ -170,18 +240,16 @@ class GaussianImage(torch.nn.Module):
 
         self.renderer = GaussianRenderer2D(render_plane_size)
 
-        self.covariance = self.build_covariance_matrix().to(device)
-
-        
         # initialize rgb with the target image samples
+        if init_from_rgb:
+            grid = self.mean.unsqueeze(0).view(1, self.num_gaussians, 1, 2)
+            # sample the target image at the gaussian mean points. 
+            sampled_image = torch.nn.functional.grid_sample(target_image.unsqueeze(0).permute(0,3,1,2), grid) 
+            sampled_image = sampled_image.squeeze(0).squeeze(2)
 
-        norm_mean = self.mean * 2 - 1
-        grid = norm_mean.unsqueeze(0).view(1, self.num_gaussians, 1, 2)
-        # sample the target image at the gaussian mean points. 
-        sampled_image = torch.nn.functional.grid_sample(target_image.unsqueeze(0).permute(0,3,1,2), grid) 
-        sampled_image = sampled_image.squeeze(0).squeeze(2)
-
-        self.rgb = torch.nn.Parameter(sampled_image.permute(1,0).to(device), requires_grad=True)
+            self.rgb = torch.nn.Parameter(sampled_image.permute(1,0).to(device), requires_grad=True)
+        else:
+            self.rgb = torch.nn.Parameter(torch.rand((self.num_gaussians, 3)).to(device), requires_grad=True)
 
         self.myparamlist = torch.nn.ParameterList([self.mean, self.rgb, self.alpha, self.scale, self.theta])
 
@@ -194,20 +262,24 @@ class GaussianImage(torch.nn.Module):
 
         # theta might overflow and cause NaNs.
         theta_activated = circular_activation(self.theta)
-        # theta_activated = self.theta * torch.tensor(2) * torch.pi
 
         cos_theta = torch.cos(theta_activated)
         sin_theta = torch.sin(theta_activated)
 
-        
         # build a 2x2 tensor with cos(theta) and sin(theta)
-        # TODO - check if this is the right way to build a 2x2 tensor without losing sin and cos
         rot_mat = torch.stack([
             torch.concat([cos_theta, -sin_theta], dim=-1),
             torch.concat([sin_theta, cos_theta], dim=-1)
         ], dim=-2)
-        # rot_mat = torch.tensor([[torch.cos(theta_activated), -torch.sin(theta_activated)], [torch.sin(theta_activated), torch.cos(theta_activated)]])
+
+        print(f"rot_mat min - {rot_mat.min()}, max - {rot_mat.max()}") if DEBUG else None
+        print(f"scale min - {self.scale.min()}, max - {self.scale.max()}") if DEBUG else None
+        
+        # TODO - Debug sigmoid activations for scale
+        # scale_activated = torch.sigmoid(self.scale)
         scale_activated = self.scale
+        # scale_activated = torch.clamp(self.scale,0.01,4.0)
+
         # create diagonal scale matrix
         scale_mat = torch.eye(scale_activated.shape[1]).to(device).unsqueeze(0) * scale_activated.unsqueeze(-1)
 
@@ -215,36 +287,27 @@ class GaussianImage(torch.nn.Module):
         rot_transpose = torch.transpose(rot_mat,-1,-2)
         covariance = rot_mat @ scale_mat @ scale_transpose @ rot_transpose
 
-        # covariance = torch.tensor(([[0.3, 0.4], [0.1, 0.15]]))
-        # covariance = covariance.unsqueeze(0).repeat(self.num_gaussians,1,1)
+        # add a small jitter to the covariance matrix to make it invertible
+        # Not having this causes NaNs in the gaussian pdf calculation randomly
+        jitter = 1e-6 * torch.eye(covariance.shape[-1]).to(device).unsqueeze(0)
+        covariance = covariance + jitter
 
         return covariance
     
     def forward(self):
         
-        # activate all parameters with sigmoid
-        # activated_mean = torch.sigmoid(self.mean)
-        # activated_rgb = torch.sigmoid(self.rgb)
-        # activated_alpha = torch.sigmoid(self.alpha)
-        # activated_scale = torch.sigmoid(self.scale)
-
-        # gaussian_reconstruction = self.renderer.render(activated_mean, self.covariance, activated_rgb, activated_alpha, self.num_gaussians)
-        self.covariance = self.build_covariance_matrix()
-        gaussian_reconstruction = self.renderer.render(self.mean, self.covariance, self.rgb, self.alpha, self.num_gaussians)
+        covariance = self.build_covariance_matrix()
+        gaussian_reconstruction = self.renderer.render(self.mean, covariance, self.rgb, self.alpha, self.num_gaussians)
 
         return gaussian_reconstruction
     
-# new_img = GaussianImage(10)
-num_gaussians = 200
-render_plane_size = 64
-num_steps = 1000
+num_gaussians = 1500
+render_plane_size = 128
+num_steps = 3000
 
-# Sets up a timestamped log directory.
-logdir = "logs/" + datetime.now().strftime("%Y%m%d-%H%M%S")
-# Creates a file writer for the log directory.
-writer = SummaryWriter()
+curr_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+writer = SummaryWriter(f"runs/{curr_time}") # tensorboard logging init
 
-# target_image = torch.rand((render_plane_size, render_plane_size, 3)).to(device)
 target_image = load_image("trinity.jpg").to(device)
 
 # resize the image to render plane size
@@ -252,8 +315,11 @@ target_image = torch.nn.functional.interpolate(target_image.unsqueeze(0).permute
 target_image = target_image.squeeze(0).permute(1,2,0)
 
 gaussian_image = GaussianImage(num_gaussians, render_plane_size).to(device)
-optimizer = torch.optim.Adam(gaussian_image.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(gaussian_image.parameters(), lr=0.01)
+scheduler = MultiStepLR(optimizer, milestones=[400,1200], gamma=0.8)
+
 l1_loss = torch.nn.L1Loss().to(device)
+
 writer.add_image("Target Image", target_image.detach().permute(2,0,1), 0) # permute to make it CHW
 
 global_step = 0
@@ -263,27 +329,37 @@ for step in range(num_steps):
     optimizer.zero_grad()
     reconstructed_image = gaussian_image()
     loss = l1_loss(reconstructed_image, target_image) 
-    # loss += pytorch_ssim.ssim(reconstructed_image.unsqueeze(0), target_image.unsqueeze(0))
 
-    loss.backward(retain_graph=True)
-    # loss.backward()
+    # TODO - Try SSIM loss
+    # loss = loss + pytorch_ssim.ssim(reconstructed_image.permute(2,0,1).unsqueeze(0), target_image.permute(2,0,1).unsqueeze(0)).to(device)
+
+    loss.backward()
+
+    # TODO Try clipping gradients
+    # torch.nn.utils.clip_grad_norm_(gaussian_image.scale, 1)
+    # torch.nn.utils.clip_grad_value_(gaussian_image.alpha, 0.00392) # 1/255
+
     optimizer.step()
+    scheduler.step()
     reconstructions = torch.cat((reconstructions, reconstructed_image.detach().unsqueeze(0)), 0)
 
     if DEBUG and (step + 1) % 25 == 0:
         debug_reconstructions(reconstructions,"", 25)
         reconstructions = torch.empty(0, *target_image.shape).to(device)
 
-    print(f"Step {step} loss: {loss}")
-    if step % 10 == 0:
+    print(f">>>> Step {step} loss: {loss} <<<<")
+    if step % 30 == 0:
         writer.add_scalar("loss", loss, step)
-        writer.add_image("Gaussian Image", reconstructed_image.detach().permute(2,0,1), 0) # permute to make it CHW
+        detached_img = reconstructed_image.detach()
+        writer.add_image("Gaussian Image", detached_img.permute(2,0,1), step) # permute to make it CHW
+        write_image(f"runs_videos/{curr_time}/frames/{step}.jpg", detached_img.cpu().numpy())
 
 
 # Save the model
 save_model(gaussian_image, "gaussian_image.pt")
 
 # Save the reconstructed image to disk
-imageio.imwrite("reconstructed_image.png", reconstructed_image.detach().cpu().numpy())
-imageio.imwrite("target_image.png", target_image.detach().cpu().numpy())
+write_image(f"runs_videos/{curr_time}/reconstructed_image.png", reconstructed_image.detach().cpu().numpy())
+write_image(f"runs_videos/{curr_time}/target_image.png", target_image.detach().cpu().numpy())
+
 
