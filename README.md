@@ -11,6 +11,11 @@ Reconstructed Image (using 1500 gaussians)
 
 ![Reconstructed Image](reconstructed_image.png)
 
+Optimization Progress
+
+![Optimization Grid](optim_grid.jpg)
+
+
 ## Overview
 
 ### GaussianRenderer2D
@@ -21,6 +26,10 @@ This class renders 2D Gaussian distributions onto a plane. The class defines a g
 
 This class represents an image as a mixture of Gaussians. It defines five trainable parameters - means, rgb, alpha, theta, and scale of the Gaussians, as well as their RGB color values.
 
+### Scope for improvement
+
+There is definitely scope for improvement here. The edges of the image are not getting reconstructed sharply. Secondly, none of the optimization strategies used in the original paper are implemented here.
+
 ## Usage
 
 To run the script,  run the `2d_splatter.py` script.
@@ -28,3 +37,5 @@ To run the script,  run the `2d_splatter.py` script.
 ```sh
 python 2d_splatter.py
 ```
+
+ 
